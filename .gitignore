@@ -10,3 +10,8 @@ drafter/data/
 drafter/runs/
 .env
 kv-persist-cache/
+# local reproduction artifacts (symlinks here, so no trailing slash)
+venv
+models
+api_key.txt
+bench/results/

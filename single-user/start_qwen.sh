@@ -28,6 +28,15 @@
 # CTX=longfp8: DFlash2 + fp8 KV via FlashInfer, 150k context, 3 drafts. This
 #   is the long-context DFlash2 variant; unlike CTX=long it does not use the
 #   custom Triton int8 KV path.
+#   KNOW THE EXPOSURE: fp8 KV has exactly ONE backend on sm86 -- FLASH_ATTN
+#   refuses it (needs FA3/SM90+) and TRITON_ATTN refuses it (needs SM89+),
+#   both measured -- so this tier runs FlashInfer with no A/B possible, and
+#   issue #34 tracks a deterministic Xid-31 MMU write-fault seen twice on one
+#   3090 under fp8+MTP+prefix caching at ~28-34k context. The flashinfer-free
+#   fallback is the int8 tier (gotcha 44): what SPEC=dflash2 CTX=long already
+#   ships, or for mtp: VLLM_SPEC_DECODE_ATTN=1 EXTRA_ARGS="--attention-backend
+#   =TRITON_ATTN --kv-cache-dtype=int8_per_token_head" at ~25% wall cost at
+#   depth (23.7 vs 18.9 s for 17.9k in + 256 out, measured).
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/), 200k context with MTP, at roughly
 #   half the decode rate past 100k — see below and docs/long-context.md.
 #
@@ -94,6 +103,10 @@ CTX=${CTX:-fast}
 #   (vLLM 0.28.0 native DFlash2, plus the repo's lookup/chain patches). CTX=fast (bf16, 64k), CTX=long (int8,
 #   128k) or, with kvarn/install.sh, CTX=huge (KVarN 4/2-bit, 240k + prefix
 #   caching); see README "DFlash2".
+# SPEC=off (or none): no speculative decoding at all. This used to fall through
+#   to the mtp branch silently -- an A/B with "SPEC=off" was really running two
+#   spec-on arms, which is exactly the trap PR #46's campaign walked into with
+#   alternative.sh. Any other value now refuses instead of proceeding.
 SPEC=${SPEC:-mtp}
 # SPEC_ATTN=1: split-KV Triton attention for the multi-query verify step
 # (patches/spec-decode-attn.patch); bf16 KV only, so CTX=fast only.
@@ -424,11 +437,21 @@ if [ "$SPEC" = "dflash2" ]; then
          "5-10x slower. Ladder 4k/16k TTFT against known-good rates before trusting it." >&2
   fi
   [ -n "$KV_MEM" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
-else
+elif [ "$SPEC" = "off" ] || [ "$SPEC" = "none" ]; then
+  MAX_SEQS=${MAX_SEQS:-8}
+  SPEC_CFG=""
+  CG=${CG:-32}
+elif [ "$SPEC" = "mtp" ]; then
   MAX_SEQS=${MAX_SEQS:-8}
   SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
   CG=${CG:-32}
+else
+  echo "SPEC=$SPEC is not a mode: mtp (default), dflash2, off. Refusing rather than" >&2
+  echo "silently running mtp -- an unrecognized SPEC in an A/B measures the wrong thing." >&2
+  exit 1
 fi
+SPEC_ARGS=()
+[ -n "$SPEC_CFG" ] && SPEC_ARGS=(--speculative-config "$SPEC_CFG")
 
 # PREFIX_CACHE=1: reuse the KV of a shared prompt prefix across requests, and resume the
 # recurrent (GDN) state from the last cached block boundary instead of re-running the prompt.
@@ -667,8 +690,8 @@ fi
 # the escape hatch -- a limitation of these kernels, not of any checkpoint.
 case " ${EXTRA_ARGS:-} " in
   *" --dtype float16 "*|*" --dtype=float16 "*|*" --dtype fp16 "*|*" --dtype=fp16 "*|*" --dtype half "*|*" --dtype=half "*)
-    if [ "${SPEC:-mtp}" != "none" ]; then
-      echo "--dtype float16 needs SPEC=none: this repo's speculative path is bf16-only." >&2
+    if [ "$SPEC" != "none" ] && [ "$SPEC" != "off" ]; then
+      echo "--dtype float16 needs SPEC=off: this repo's speculative path is bf16-only." >&2
       echo "  the split-KV verify attention casts to tl.bfloat16 (patches/spec-decode-attn.patch)," >&2
       echo "  so it fails to compile at the first attention. See issue #27." >&2
       exit 1
@@ -706,7 +729,7 @@ CUSTOM_OPS=${CUSTOM_OPS:-[\"+rms_norm\",\"+silu_and_mul\"]}
 exec venv/bin/vllm serve "$MODEL" \
   --chat-template "$CHAT_TEMPLATE" \
   --served-model-name qwen3.8-27b \
-  --host 0.0.0.0 --port $PORT \
+  --host ${HOST:-0.0.0.0} --port $PORT \
   --gpu-memory-utilization $GPU_UTIL \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
@@ -716,9 +739,10 @@ exec venv/bin/vllm serve "$MODEL" \
   --mamba-ssm-cache-dtype float16 \
   ${ASYNC_ARGS} \
   --max-num-batched-tokens $BATCHED_TOKENS \
-  --speculative-config "$SPEC_CFG" \
+  "${SPEC_ARGS[@]}" \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":$CUSTOM_OPS${CG_MODE}}" \
   --reasoning-parser qwen3 \
+  --enable-prompt-tokens-details \
   ${TOOL_ARGS} \
   "${KV_TRANSFER_ARGS[@]}" \
   ${EXTRA_ARGS}
