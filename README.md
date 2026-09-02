@@ -50,8 +50,11 @@ configuration is three environment variables away:
 [If you are the only user](#if-you-are-the-only-user-do-this).
 
 Prefill is a separate budget from either: ~1,810 tok/s at 1k inputs in batch
-mode (~1,210 single-user), ~1,000 tok/s at 100k, so a 100k prompt costs ~100 s
-of TTFT ([full matrix](batch/README.md#prefill)). How each number was won:
+mode, and in single-user mode ~1,440 tok/s stock or **~1,850-1,940 with
+`INT8_ACT=int8`** (1,423 at 51k in), measured on the seeded benchmark protocol
+([full matrix](batch/README.md#prefill); older published prefill rows came
+from an unseeded harness that let the prefix cache contaminate the numbers,
+and are not comparable). How each number was won:
 [docs/optimizations.md](docs/optimizations.md).
 
 The server listens on `0.0.0.0` and is unauthenticated unless you give it a key.
@@ -461,10 +464,18 @@ kernel, which the drafter's 8-row draft block needs
 The trade: the Triton attention backend plus the per-step int4 unpack cost
 about 20% of decode against the shipped config on short prompts (~86 vs ~104
 tok/s e2e on the same probe), and — unlike KVarN, which has GSM8K and
-100k-needle numbers above — **int4-KV quality at depth is unmeasured here**.
-Tool calling round-trips correctly and the lookup lane works; treat the rest
-as experimental until someone runs the quality harness on it, which is a
-contribution this README will gladly take.
+100k-needle numbers above — int4-KV quality at depth now reads:
+
+| metric | result |
+|---|---|
+| GSM8K exact-match (200 questions, greedy, thinking off) | **96.0%** |
+| 100k-token needle at 90% depth (`bench/needle_test.py`) | **retrieved** |
+
+Measured on an RTX 4090 (24 GB) with `bench/quality_battery.py int4kv --gsm-only
+--gsm-n 200` and `bench/needle_test.py 100000 0.9`; the 96.0% sits inside the band
+the other configurations read (95.0-96.5%, docs/quality.md). Tool calling
+round-trips correctly and the lookup lane works; the rest of this configuration
+is still experimental.
 
 ### More than one GPU
 
