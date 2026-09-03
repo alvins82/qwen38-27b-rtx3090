@@ -804,3 +804,81 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     but truncates the specialisation attributes at 120 characters, which is
     why it could name the kernel and not the cause. `KVARN_LOOKUP_BLOCKS`
     pins the lookup size if a deployment ever needs to.
+
+51. **`prompt_logprobs` is wrong on `CTX=huge` + `SPEC=mtp` + prefix caching, and
+    the NaN 400s are only its visible half.** Reported as
+    [#64](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/64) from a WSL2
+    3090 — `bench/quality_battery.py --ppl-only` failing with
+    `{"message":"Out of range float values are not JSON compliant: nan"}` on
+    some documents, and perplexity drifting 3.7% between identical runs.
+    Reproduced here on bare metal, on the reporter's own document indices, so
+    it is not a WSL2 effect. What it actually takes is all three of KVarN, MTP
+    and `PREFIX_CACHE=1`; the same 106-document battery, same checkpoint, two
+    concurrent workers:
+
+    | profile | NaN batteries | en perplexity |
+    |---|---|---|
+    | `CTX=huge` `SPEC=mtp` `PREFIX_CACHE=1` | 4 of 5 | 12.6-13.7, drifting |
+    | `CTX=huge` `SPEC=mtp` `PREFIX_CACHE=0` | 0 of 5 | **10.7628**, identical across runs |
+    | `CTX=huge` `SPEC=off` `PREFIX_CACHE=1` | 0 of 5 | 10.7646 |
+    | `CTX=huge` `SPEC=dflash2` `PREFIX_CACHE=1` | 0 of 5 | 10.7643 |
+    | `CTX=fast`, `off` / `mtp` / `dflash2` | 0 of 6 | 10.7614 / 10.7659 / 10.7633 |
+
+    So the inflated perplexity and the NaN are one bug, not two: in the broken
+    combination the logprobs that come back are ~23% worse on English than the
+    same server produces with prefix caching off, and the requests whose
+    corruption reaches a non-finite float are the ones that 400. Every clean
+    configuration agrees to four decimals, which is also what makes the broken
+    one unmistakable.
+
+    Two things that look like the cause and are not. **The documents**: sent one
+    at a time on a single thread, all of them return clean logprobs — it needs
+    co-scheduled requests, and the failures land on adjacent index pairs, which
+    under two workers are exactly the pairs that share a prefill batch. **The
+    pool size**: within MTP it is geometry-dependent (failed at 299k and 312k
+    tokens of pool, clean at 265k, 352k, 359k and 390k), which is what makes it
+    look intermittent across boots — but `SPEC=dflash2` pinned to 312,242
+    tokens, matching the failing MTP geometry to 0.02%, is clean, so the
+    speculator is the variable and the geometry only decides whether it fires.
+    `MAX_LEN` is not involved: 240000 and the 245760 default both fail and both
+    pass depending on the rest.
+
+    Practical rule until the read path is fixed: measure perplexity or anything
+    else using `prompt_logprobs` on KVarN with `PREFIX_CACHE=0`, or on a
+    non-MTP speculator. Ordinary generation is not implicated — needle
+    retrieval and decode rates are normal on the same server.
+
+52. **`DFLASH_TOKENS=15` asserted at engine start on the int4 path, because the
+    drafter's promoted block only has to *cover* the primary page, not divide
+    it.** Filed as
+    [#63](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/63), fixed in
+    `patches/hybrid-sw-block-promote.patch`. `alternative.sh`
+    (`int4_per_token_head`) died in a bare `assert` in
+    `kv_cache_coordinator.py` at `DFLASH_TOKENS=15` — at any `MAX_LEN`, with
+    prefix caching on or off — while `DFLASH_TOKENS=7` on the identical config
+    booted.
+
+    The chain, all of it visible in the boot log:
+
+    | | `DFLASH_TOKENS=7` | `DFLASH_TOKENS=15` |
+    |---|---|---|
+    | mamba page (grows with the spec-decode state) → primary block | 1696 | **1840** |
+    | drafter's covering block (16 → smallest multiple whose page covers) | 848 | **928** |
+    | primary / drafter | exactly 2 | 1.983 |
+    | result | boots | `AssertionError` |
+
+    The scheduler's granularity is the LCM of the primary groups' blocks and
+    every group's block has to divide it. `_promote_indivisible_block_sizes`
+    only guaranteed the drafter's page *covers* the maximum, and 848 divided
+    1696 by luck. The fix rounds the promotion up to the smallest divisor of
+    the primary block instead — 928 → 1840, after which the primary layers
+    scale 1840 → 3680 through the branch they already take.
+
+    Two things worth knowing. **It is an int4-only shape**: on
+    `int8_per_token_head` (`CTX=long`) the primary block and the drafter's
+    covering block come out *equal* (864 at 7, 944 at 15), so divisibility is
+    free and both arms are byte-identical before and after the fix —
+    `CTX=long DFLASH_TOKENS=7` still pools 138,696 tokens. **The wider verify
+    block is not free on int4**: at 15 the pool is 53,908 tokens against
+    142,843 at 7, and the 256k default no longer fits (`estimated maximum
+    model length is 180320`, a clear `ValueError` rather than an assert).
