@@ -766,6 +766,12 @@ and follow its README:
 - **[batch/](batch/)** — throughput. `bash batch/start_qwen.sh`
 - **[single-user/](single-user/)** — latency. `bash single-user/start_qwen.sh`
 
+Both launchers use the bundled Froggeric Qwen 3.8 v22.3 chat template
+(`chat_template-froggeric-v22.4.jinja`) with native XML tool calls. Set
+`CHAT_TEMPLATE=/path/to/another.jinja` to A/B-test or roll back the template
+without changing the model files. The bundled file is pinned to Froggeric
+Hugging Face revision `756cfb69d742355fd310b4ba9d50815a27d9d241` (Froggeric v22.4).
+
 First start takes a few minutes (torch.compile, CUDA graph capture, flashinfer
 JIT). Test it:
 
