@@ -29,7 +29,6 @@ docker compose --profile batch  up -d    # API backend, many concurrent requests
 | single-stream (C1) decode rate, realistic prompts | 46 tok/s | MTP: **121** tok/s at default sampling, **120** greedy (`CTX=fast`, 64k; 96 / 102 with `CTX=long`, 150k). DFlash2 (`SPEC=dflash2`): **127** default, **130** greedy |
 | reproducing its own context (quoting a document, applying an edit) | 46 tok/s | **381 tok/s** at 25k context — 15.0 tokens per verify step, drafted straight from the prompt (`SPEC=dflash2` + `DFLASH_TOKENS=15`) |
 | trick | 16-bit recurrent state + int8 tensor-core GEMMs | MTP speculation with 4 cheap drafts, a draft vocabulary that covers what the model says, calibrated int4 lm_head/drafter, split-KV verify attention; optionally native vLLM 0.28.0 DFlash2 (7 drafts in one pass, int4-requantized) with a verify block the context fills |
-
 <sub>Single-stream numbers re-measured 2026-08-22 on current main with
 `bash bench/run_benchmarks.sh single` — `vllm bench serve`, the 8 prompts in
 `bench/prompts_real.jsonl`, 1024 output tokens, C1, decode rate taken as
@@ -37,9 +36,9 @@ docker compose --profile batch  up -d    # API backend, many concurrent requests
 length is not measuring the same thing, and mixing the two is how
 [#3](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/3) got confusing.</sub>
 
-> Version note: this branch pins vLLM 0.28.0. The throughput and quality tables are
-> v0.27.1/reference baselines and need to be re-benchmarked on a GPU after this
-> upgrade; this environment validated patch application and Python compilation only.
+> Version note: this branch pins vLLM 0.28.0; the throughput and quality tables are
+> retained as reference baselines while the v0.28.0 GPU matrix is being re-measured.
+
 Both modes share one install — the mode is just which launch script you run.
 Speculation wins below ~8 concurrent users on short prompts, plain batching above;
 on long independent sessions the crossover is much earlier, because a speculating
@@ -222,7 +221,7 @@ did not mix on this path. On WSL2 that showed up as acceptance collapsing to
 about one token per step; on bare metal it also **corrupted the output** —
 special-token ids leaking into the stream, 1 of 1,176 characters matching the
 source instead of all of them. It is the capture rather than the drafter: eager
-is clean, `VLLM_DFLASH2_LOOKUP=0` is not, forcing a fixed verify-block length is not, and
+is clean, `LOOKUP=0` is not, forcing a fixed verify-block length is not, and
 PIECEWISE — which keeps the compiled graphs and leaves only the multi-query
 verify uncaptured — restored both the speed and the correctness on both machines.
 
@@ -667,7 +666,7 @@ greedy):
 | + GPTQ-int4 lm_head (calibrated) | 109 / 112 | 2.8 / 2.8 | 73% / 73% |
 | + GPTQ-int4 MTP module (**fast variant, shipped**) | **~114 / 118-124** | 2.8 / 2.9-3.0 | 74% / 77% |
 | DFlash2 block drafter instead of MTP (`SPEC=dflash2`, int4-requantized) | **118 / 126** | 3.14 / 3.34 | ~75% / ~78% |
-| + drafting from the context (`VLLM_DFLASH2_LOOKUP=1`, on by default) | **130** at C1, up to **259** where the model reproduces its context | 3.3-7.8 | |
+| + drafting from the context (`LOOKUP=1`, on by default) | **130** at C1, up to **259** where the model reproduces its context | 3.3-7.8 | |
 | + a 16-token verify block the context fills (`DFLASH_TOKENS=15`) | **133** at C1, up to **381** reproducing context | 3.4-15.0 | |
 
 (Steps 4-6 are the same 8-prompt protocol; greedy is deterministic for a
@@ -766,12 +765,6 @@ and follow its README:
 
 - **[batch/](batch/)** — throughput. `bash batch/start_qwen.sh`
 - **[single-user/](single-user/)** — latency. `bash single-user/start_qwen.sh`
-
-Both launchers use the bundled Froggeric Qwen 3.8 v22.3 chat template
-(`chat_template-froggeric-v22.4.jinja`) with native XML tool calls. Set
-`CHAT_TEMPLATE=/path/to/another.jinja` to A/B-test or roll back the template
-without changing the model files. The bundled file is pinned to Froggeric
-Hugging Face revision `756cfb69d742355fd310b4ba9d50815a27d9d241` (Froggeric v22.4).
 
 First start takes a few minutes (torch.compile, CUDA graph capture, flashinfer
 JIT). Test it:
